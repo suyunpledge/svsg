@@ -1,0 +1,473 @@
+"""L3 编排循环：FSM 事件驱动的主控流程（Phase 1 MVP 闭环入口）。
+
+流程（与 FSM 状态一一对应）：
+  S0 校验管道（S2 硬拒绝 / S3 软依赖）
+   → 验证阶段（verification_required 实例 → S4a → L1.5）
+   → L3 生成（双通道答案，受总超时约束）
+   → 强制后置锚定校验（完整性 + 忠实度）
+   → ANCHOR_PASSED 交付 / VERIFICATION_SKIPPED 重试验证 /
+     ANCHOR_FAILED 带修正反馈重生成（预算 1 次）/ 超预算 S6 人工复审
+
+静默降级（V5.2.1 §5.1）：L1.5 超时 → VERIFICATION_TIMEOUT → S6 后，
+编排器仍会调用 L3 处理其余高置信实例（部分可用性）：降级实例在
+Prompt 中标注、在锚定中豁免完整性检查（exempt）、仅锚定 IR；
+交付结果带 human_review 语义（delivered_with_review）。
+
+防循环约束：
+- FSM 重试守卫（session.retries_used，上限 1）管住 S3 重入；
+- max_llm_calls（默认 2 = 首答 + 1 次重生成）管住 L3 调用总量，
+  ANCHOR_FAILED → S4 → CONFLICT_RESOLVED 的 FSM 循环由此封顶。
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import Any, Protocol
+from uuid import uuid4
+
+from svsg.contracts import (
+    IR,
+    ErrorCode,
+    L3Answer,
+    SceneType,
+    StateCode,
+    SVSGError,
+    VerificationReport,
+    VerificationStatus,
+)
+from svsg.l2_runtime import (
+    ConflictThresholds,
+    Event,
+    ResolutionOutcome,
+    RuntimeSession,
+    check_dependencies,
+    missing_verifications,
+    resolve_conflict,
+    run_anchor,
+    validate_ir_payload,
+)
+from svsg.l2_runtime.evidence_anchor import AMBIGUOUS_LABEL
+from svsg.l15_verifier import L15Verifier, assert_timeout_budget
+
+from .prompts import build_context, build_system_prompt
+
+
+class LLMProtocol(Protocol):
+    """纯文本主控 LLM 接口（OpenAI 兼容适配器只需实现本协议）。"""
+
+    async def complete(self, system_prompt: str, context: str) -> L3Answer: ...
+
+
+@dataclass
+class StubLLM:
+    """确定性桩 LLM：按脚本顺序弹出答案，记录全部调用（供测试断言）。"""
+
+    answers: list[L3Answer] = field(default_factory=list)
+    delay_s: float = 0.0
+    fail_with: Exception | None = None
+    calls: list[dict[str, str]] = field(default_factory=list)
+
+    async def complete(self, system_prompt: str, context: str) -> L3Answer:
+        self.calls.append({"system_prompt": system_prompt, "context": context})
+        if self.delay_s:
+            await asyncio.sleep(self.delay_s)
+        if self.fail_with is not None:
+            raise self.fail_with
+        if not self.answers:
+            raise RuntimeError("StubLLM 脚本答案已耗尽")
+        return self.answers.pop(0)
+
+
+@dataclass(frozen=True)
+class OrchestratorConfig:
+    """编排器配置。
+
+    llm_timeout_s：L3 主控总超时（L1.5 超时必须严格小于其 1/3，
+    装配期由 assert_timeout_budget 断言）。
+    max_llm_calls：L3 调用总量上限（首答 + 重生成）。
+    """
+
+    llm_timeout_s: float = 3.0
+    max_llm_calls: int = 2
+
+
+@dataclass
+class OrchestratorResult:
+    """编排结果。
+
+    status：
+    - delivered：锚定通过，正常交付；
+    - delivered_with_review：L1.5 超时降级后部分可用交付（附人工复审标记）；
+    - human_review：S6（依赖重试失败 / 冲突不可解决 / 降级模式下锚定仍失败）；
+    - rejected：S2 硬拒绝；aborted：S5 超时中止。
+    """
+
+    status: str
+    answer: L3Answer | None = None
+    anchor_violations: list[dict] = field(default_factory=list)
+    class_overrides: dict[int, str] = field(default_factory=dict)
+    degraded_instances: set[int] = field(default_factory=set)
+    disputed_instances: set[int] = field(default_factory=set)
+    session_summary: dict = field(default_factory=dict)
+    error: dict | None = None
+
+    @property
+    def delivered(self) -> bool:
+        return self.status in ("delivered", "delivered_with_review")
+
+    @property
+    def human_review_required(self) -> bool:
+        return self.status in ("delivered_with_review", "human_review")
+
+
+@dataclass
+class _VerificationRound:
+    """一次验证轮的产物。"""
+
+    status: str  # consistent / resolved / timeout / unresolved
+    report: VerificationReport | None
+    executed: set[int]
+    overrides: dict[int, str]
+    degraded: set[int]
+    disputed: set[int]
+
+
+class Orchestrator:
+    """SVSG 主控编排器（无状态，依赖全部注入）。"""
+
+    def __init__(
+        self,
+        verifier: L15Verifier,
+        llm: LLMProtocol,
+        config: OrchestratorConfig | None = None,
+        conflict_thresholds: ConflictThresholds | None = None,
+    ) -> None:
+        self._verifier = verifier
+        self._llm = llm
+        self._config = config or OrchestratorConfig()
+        self._conflict_thresholds = conflict_thresholds or ConflictThresholds()
+        # V5.2.1 §5.1：L1.5 超时必须严格小于 L3 总超时的 1/3（装配期断言）
+        assert_timeout_budget(verifier.config.timeout_s, self._config.llm_timeout_s)
+
+    # ------------------------------------------------------------------
+
+    async def run(
+        self,
+        query: str,
+        ir_payload: dict[str, Any] | IR,
+        *,
+        ir_rebuilder: Callable[[], dict[str, Any] | None] | None = None,
+    ) -> OrchestratorResult:
+        """执行完整编排循环。
+
+        ir_rebuilder：S3 软重试的 IR 重建回调（真实系统中触发 L1 重编译）；
+        未提供时依赖缺失直接 RETRY_FAILED → S6。
+        """
+        session = RuntimeSession(f"sess_{uuid4().hex[:12]}")
+
+        # ---- S0：校验管道
+        try:
+            ir = validate_ir_payload(ir_payload)
+        except SVSGError as err:
+            session.transition(Event.VALIDATION_FAILED)
+            return self._result("rejected", session, error=err.to_dict())
+        session.bind_ir(ir)
+        session.transition(Event.VALIDATION_PASSED)  # S0 → S1
+
+        # ---- S3：依赖软检查（悬空引用）
+        if check_dependencies(ir):
+            session.transition(Event.DEPENDENCY_MISSING)
+            rebuilt = (
+                self._rebuild_ir(session, ir_rebuilder) if ir_rebuilder is not None else None
+            )
+            if rebuilt is None:
+                session.transition(Event.RETRY_FAILED)
+                return self._result("human_review", session)
+            ir = rebuilt  # 重建成功后以新 IR 作为后续权威（消除悬空引用）
+
+        # ---- 验证阶段：verification_required 实例 → L1.5
+        overrides: dict[int, str] = {}
+        degraded: set[int] = set()
+        disputed: set[int] = set()
+        report: VerificationReport | None = None
+        executed: set[int] = set()
+
+        need = sorted(d.instance_id for d in ir.detections if d.verification_required)
+        if need:
+            rnd = await self._verification_round(session, ir, need)
+            report, executed = rnd.report, rnd.executed
+            if rnd.status == "unresolved":
+                return self._result(
+                    "human_review", session, overrides=rnd.overrides
+                )
+            overrides, degraded, disputed = (
+                rnd.overrides,
+                rnd.degraded,
+                rnd.disputed,
+            )
+
+        eff_ir = self._effective_ir(ir, overrides)
+        feedback: list[dict] | None = None
+        llm_calls = 0
+
+        # ---- 生成 + 锚定循环
+        while True:
+            if llm_calls >= self._config.max_llm_calls:
+                # 预算耗尽仍需重生成 → 视为冲突不可解决
+                if session.state == StateCode.S4:
+                    session.transition(Event.CONFLICT_UNRESOLVED)
+                return self._result(
+                    "human_review", session, overrides=overrides,
+                    degraded=degraded, disputed=disputed,
+                )
+            llm_calls += 1
+
+            answer = await self._call_llm(
+                query, eff_ir, report, degraded, disputed, feedback, session
+            )
+            if answer is None:  # L3 超时/故障 → S5（_call_llm 已转移）
+                return self._result(
+                    "aborted", session, degraded=degraded, disputed=disputed
+                )
+
+            verdict = run_anchor(eff_ir, answer, executed, report, exempt=degraded)
+
+            if verdict.passed:
+                if not session.is_terminal:
+                    session.transition(Event.ANCHOR_PASSED)
+                status = (
+                    "delivered_with_review"
+                    if (session.state == StateCode.S6 or degraded or disputed)
+                    else "delivered"
+                )
+                return self._result(
+                    status, session, answer=answer, overrides=overrides,
+                    degraded=degraded, disputed=disputed,
+                )
+
+            if session.is_terminal:
+                # S6 降级模式下锚定仍失败：答案否决，维持人工复审（不再转移）
+                return self._result(
+                    "human_review", session,
+                    violations=verdict.violations, degraded=degraded,
+                    disputed=disputed, overrides=overrides,
+                )
+
+            if verdict.primary_code == ErrorCode.VERIFICATION_SKIPPED:
+                # E2003：漏验证 → 打回 S3（共享 FSM 重试预算）
+                session.transition(Event.VERIFICATION_SKIPPED)
+                if session.state == StateCode.S6:
+                    return self._result(
+                        "human_review", session,
+                        violations=verdict.violations, overrides=overrides,
+                        degraded=degraded, disputed=disputed,
+                    )
+                session.transition(Event.RETRY_SUCCEEDED)  # 回 S1 重走验证
+                missing = sorted(
+                    missing_verifications(eff_ir, executed, exempt=degraded)
+                )
+                if missing:
+                    rnd = await self._verification_round(session, eff_ir, missing)
+                    report = self._merge_reports(report, rnd.report)
+                    executed |= rnd.executed
+                    if rnd.status == "unresolved":
+                        return self._result(
+                            "human_review", session,
+                            overrides=overrides | rnd.overrides,
+                            degraded=degraded | rnd.degraded,
+                            disputed=disputed | rnd.disputed,
+                        )
+                    overrides |= rnd.overrides
+                    degraded |= rnd.degraded
+                    disputed |= rnd.disputed
+                    eff_ir = self._effective_ir(ir, overrides)
+                feedback = None
+                continue  # 重新生成答案（循环头部强制预算）
+
+            # EVIDENCE_MISMATCH：答案与证据不一致 → S4 → 修正反馈重生成
+            session.transition(Event.ANCHOR_FAILED)
+            feedback = [v.to_dict() for v in verdict.violations]
+            if llm_calls >= self._config.max_llm_calls:
+                session.transition(Event.CONFLICT_UNRESOLVED)
+                return self._result(
+                    "human_review", session, violations=verdict.violations,
+                    overrides=overrides, degraded=degraded, disputed=disputed,
+                )
+            session.transition(Event.CONFLICT_RESOLVED)  # 以修正反馈重生成
+
+    # ------------------------------------------------------------------
+    # 验证轮
+
+    async def _verification_round(
+        self, session: RuntimeSession, ir: IR, ids: list[int]
+    ) -> _VerificationRound:
+        """S1 → S4a → L1.5 → (consistent / conflict / timeout)。"""
+        session.transition(Event.VERIFICATION_REQUESTED)
+        report = await self._verifier.verify_instances(ir.image_id, ids)
+
+        if report.status != VerificationStatus.SUCCESS:
+            # 静默降级：不进 S4，直接 S6；降级实例记录在会话中
+            session.transition(Event.VERIFICATION_TIMEOUT, degraded=set(ids))
+            return _VerificationRound(
+                "timeout", report, set(), {}, set(ids), set()
+            )
+
+        executed = {r.instance_id for r in report.results}
+        by_id = {d.instance_id: d for d in ir.detections}
+        conflicts = []
+        for r in report.results:
+            det = by_id.get(r.instance_id)
+            if (
+                det is not None
+                and r.class_label is not None
+                and r.class_label != AMBIGUOUS_LABEL
+                and r.class_label != det.object_class
+            ):
+                conflicts.append((det, r))
+
+        if not conflicts:
+            session.transition(Event.VERIFICATION_CONSISTENT)
+            return _VerificationRound("consistent", report, executed, {}, set(), set())
+
+        session.transition(Event.VERIFICATION_CONFLICT)
+        overrides: dict[int, str] = {}
+        disputed: set[int] = set()
+        for det, r in conflicts:
+            resolution = resolve_conflict(det, r, self._conflict_thresholds)
+            if resolution.outcome == ResolutionOutcome.UNRESOLVED:
+                session.transition(Event.CONFLICT_UNRESOLVED)
+                return _VerificationRound(
+                    "unresolved", report, executed, {}, set(), set()
+                )
+            if resolution.outcome == ResolutionOutcome.ADOPT_VERIFICATION:
+                assert resolution.adopted_class is not None
+                overrides[r.instance_id] = resolution.adopted_class
+            else:  # KEEP_DETECTOR_DISPUTED：降权 + 标记争议，继续流转
+                disputed.add(r.instance_id)
+        session.transition(Event.CONFLICT_RESOLVED)
+        return _VerificationRound(
+            "resolved", report, executed, overrides, set(), disputed
+        )
+
+    # ------------------------------------------------------------------
+    # 辅助
+
+    async def _call_llm(
+        self,
+        query: str,
+        eff_ir: IR,
+        report: VerificationReport | None,
+        degraded: set[int],
+        disputed: set[int],
+        feedback: list[dict] | None,
+        session: RuntimeSession,
+    ) -> L3Answer | None:
+        """调用 L3（受总超时约束）；超时/故障 → S5 并返回 None。"""
+        physical_metrics = (
+            eff_ir.scene_type == SceneType.ORTHOGRAPHIC
+            or eff_ir.camera_intrinsics is not None
+        )
+        system = build_system_prompt(physical_metrics)
+        context = build_context(
+            query, eff_ir, report,
+            degraded=degraded, disputed=disputed,
+            corrective_feedback=feedback,
+        )
+        try:
+            return await asyncio.wait_for(
+                self._llm.complete(system, context),
+                timeout=self._config.llm_timeout_s,
+            )
+        except TimeoutError:
+            if not session.is_terminal:
+                session.transition(Event.L3_TIMEOUT)
+            return None
+        except Exception:
+            # L3 非超时故障：保守按请求中止处理（S5 语义）
+            if not session.is_terminal:
+                session.transition(
+                    Event.L3_TIMEOUT, note="L3 调用异常（非超时），请求中止"
+                )
+            return None
+
+    def _rebuild_ir(
+        self, session: RuntimeSession, rebuilder: Callable[[], dict | None]
+    ) -> IR | None:
+        """S3 软重试：重建 IR 并复检依赖。
+
+        成功时替换会话内 IR、触发 RETRY_SUCCEEDED 并返回新 IR；
+        失败（重建器返回 None、校验失败、依赖仍缺失）返回 None。
+        """
+        payload = rebuilder()
+        if payload is None:
+            return None
+        try:
+            new_ir = validate_ir_payload(payload)
+        except SVSGError:
+            return None
+        if check_dependencies(new_ir):
+            return None
+        # bind_ir 仅限 S0；重试成功路径直接替换会话内的 IR（FSM 不变量由本方法维护）
+        session.ir = new_ir
+        session.transition(Event.RETRY_SUCCEEDED)
+        return new_ir
+
+    @staticmethod
+    def _effective_ir(ir: IR, overrides: dict[int, str]) -> IR:
+        """应用冲突解决采纳的类别覆盖，生成锚定与 Prompt 共用的有效 IR。"""
+        if not overrides:
+            return ir
+        data = ir.model_dump(by_alias=True)
+        for det in data["detections"]:
+            if det["instance_id"] in overrides:
+                det["class"] = overrides[det["instance_id"]]
+        return IR.model_validate(data)
+
+    @staticmethod
+    def _merge_reports(
+        a: VerificationReport | None, b: VerificationReport | None
+    ) -> VerificationReport | None:
+        """合并两轮验证报告（同实例以后者为准）。"""
+        if a is None:
+            return b
+        if b is None:
+            return a
+        merged = {r.instance_id: r for r in a.results}
+        merged.update({r.instance_id: r for r in b.results})
+        return VerificationReport(
+            report_id=a.report_id,
+            image_id=a.image_id,
+            status=(
+                a.status
+                if a.status == VerificationStatus.SUCCESS
+                else b.status
+            ),
+            results=list(merged.values()),
+        )
+
+    def _result(
+        self,
+        status: str,
+        session: RuntimeSession,
+        *,
+        answer: L3Answer | None = None,
+        violations: Any = (),
+        overrides: dict[int, str] | None = None,
+        degraded: set[int] | None = None,
+        disputed: set[int] | None = None,
+        error: dict | None = None,
+    ) -> OrchestratorResult:
+        return OrchestratorResult(
+            status=status,
+            answer=answer,
+            anchor_violations=[
+                v.to_dict() if hasattr(v, "to_dict") else v for v in violations
+            ],
+            class_overrides=overrides or {},
+            degraded_instances=degraded or set(),
+            disputed_instances=disputed or set(),
+            session_summary=session.summary(),
+            error=error,
+        )
