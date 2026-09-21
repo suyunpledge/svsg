@@ -1,89 +1,89 @@
-# SVSG — 结构化视觉语义网关
+# SVSG — Structured Visual Semantic Gateway
 
-**让 LLM 看懂图片，但不靠 VLM 的模糊视觉。**
+**Lets an LLM understand images without relying on VLM's fuzzy vision.**
 
-## 问题
+## The Problem
 
-传统方案是把图片扔给 GPT-4V / Claude Vision，让它"看图说话"。但 VLM 的视觉感知不稳定：
+The conventional approach is to hand the image to GPT-4V / Claude Vision and let it "look and describe." But VLM visual perception is unstable:
 
-- 同一张图问两次，答案可能矛盾
-- 计数经常出错（"图里有 3 个苹果"实际有 5 个）
-- 空间关系判断模糊（"左边的杯子"到底是哪个）
+- Ask about the same image twice and the answers can contradict each other
+- Counting is often wrong ("the image has 3 apples" when there are actually 5)
+- Spatial relationships are described vaguely ("the cup on the left" — which one is that exactly)
 
-## SVSG 的解法
+## SVSG's Approach
 
-**先用检测器把图片翻译成结构化的 IR（中间表示），再把 IR 喂给 LLM 推理。**
+**First translate the image into a structured IR (intermediate representation) using a detector, then feed that IR to the LLM for reasoning.**
 
 ```
-传统：  图片 → VLM（黑盒）→ 答案（不可靠）
-SVSG：  图片 → YOLO 检测 → IR（类别/位置/数量/关系）→ LLM（白盒推理）→ 答案（可审计）
+Conventional:  Image → VLM (black box) → Answer (unreliable)
+SVSG:          Image → YOLO detection → IR (classes/positions/counts/relations) → LLM (white-box reasoning) → Answer (auditable)
 ```
 
-LLM 不需要"看"图，只需要读懂结构化的检测结果。每条结论都能追溯到具体的检测证据。
+The LLM doesn't need to "see" the image — it only needs to understand the structured detection results. Every conclusion can be traced back to concrete detection evidence.
 
-## 快速开始
+## Quick Start
 
 ```bash
-pip install -e ".[api,llm]"    # 基础服务
-python -m svsg                 # 启动（默认 127.0.0.1:3002）
+pip install -e ".[api,llm]"    # base service
+python -m svsg                 # start (default 127.0.0.1:3002)
 ```
 
 ```bash
-# 上传图片 + 提问
+# Upload an image + ask a question
 curl -X POST http://127.0.0.1:3002/v1/analyze-image \
   -F "image=@photo.jpg" \
-  -F "question=图里有几个红色的物体？"
+  -F "question=How many red objects are in the image?"
 ```
 
-## 两个核心能力
+## Two Core Capabilities
 
-### 1. 给 LLM 配上准确的 VLM 眼镜
+### 1. Give the LLM a pair of accurate VLM "glasses"
 
-精确的检测器（YOLO）负责"看"，LLM 只负责"推理"。分工明确，各取所长。
+A precise detector (YOLO) handles "seeing," and the LLM handles only "reasoning." A clear division of labor, each doing what it's best at.
 
-### 2. 证据锚定审核
+### 2. Evidence-anchored review
 
-LLM 的每条输出都会被锚定到 IR 中的检测证据。编造或无依据的断言会被自动否决。
+Every LLM output is anchored back to the detection evidence in the IR. Fabricated or unsupported claims are automatically rejected.
 
-## 架构
+## Architecture
 
 ```
-L1 检测编译 → L1.5 声明验证 → L2 运行时（FSM）→ L3 LLM 编排 → 证据锚定
+L1 detection compilation → L1.5 declaration verification → L2 runtime (FSM) → L3 LLM orchestration → evidence anchoring
 ```
 
-| 层 | 职责 |
+| Layer | Responsibility |
 |---|---|
-| L1 | 检测器适配（YOLO/stub）→ 几何关系 → IR |
-| L1.5 | 视觉验证（超时隔离 + 静默降级） |
-| L2 | FSM 状态机、意图路由、冲突解决、证据锚定 |
-| L3 | LLM 编排循环、双通道答案、锚定否决重生成 |
+| L1 | Detector adapter (YOLO/stub) → geometric relations → IR |
+| L1.5 | Visual verification (timeout isolation + silent degradation) |
+| L2 | FSM state machine, intent routing, conflict resolution, evidence anchoring |
+| L3 | LLM orchestration loop, dual-channel answers, anchor-triggered veto and regeneration |
 
-## 与传统 VLM 对比
+## Comparison with Conventional VLM
 
-| | 传统 VLM 直答 | SVSG |
+| | Conventional VLM direct answer | SVSG |
 |---|---|---|
-| 计数 | 经常出错 | 像素级检测，精确 |
-| 空间关系 | 模糊描述 | 结构化 IR（left_of/right_of/contains） |
-| 可审计 | 无法追溯 | 每条结论锚定到检测证据 |
-| 幻觉 | 高 | 低（锚定校验自动否决） |
-| 成本 | 每次调 VLM（贵） | 检测一次，LLM 只读文本（便宜） |
+| Counting | Often wrong | Pixel-level detection, precise |
+| Spatial relations | Vague descriptions | Structured IR (left_of/right_of/contains) |
+| Auditability | Can't be traced | Every conclusion anchored to detection evidence |
+| Hallucination | High | Low (anchor verification auto-vetoes unsupported claims) |
+| Cost | Every call hits the VLM (expensive) | Detect once, LLM only reads text (cheap) |
 
-## 鉴权
-
-```bash
-# 方式 1：API Key
-curl -H "X-API-Key: your-key" ...
-
-# 方式 2：Bearer 令牌（需先注册）
-curl -H "Authorization: Bearer your-token" ...
-```
-
-## 测试
+## Authentication
 
 ```bash
-python -m pytest -q    # 108 个测试
+# Method 1: API Key
+curl -H "X-API-Key: ***" ...
+
+# Method 2: Bearer token (requires prior registration)
+curl -H "Authorization: Bearer ***" ...
 ```
 
-## 许可证
+## Testing
+
+```bash
+python -m pytest -q    # 108 tests
+```
+
+## License
 
 MIT
