@@ -1,8 +1,8 @@
 """应用化装配测试：集中配置 + 图片上传端到端 + 可选鉴权。
 
 覆盖「如何让系统应用化」的机器可执行验收：
-- Settings ?????????? 127.0.0.1:3002?
-- ??? AI Platform 3001 ???openai ? base_url ??????
+- Settings 默认绑定 127.0.0.1:3002；
+- llm_provider=openai 时必须显式提供 base_url，防止误打生产端点；
 - POST /v1/analyze-image 走 image → L1 编译 → 编排 → 答案 完整闭环；
 - 可选 X-API-Key 鉴权与不可读图片的 422。
 """

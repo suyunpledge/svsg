@@ -245,7 +245,7 @@ def create_app(
         while chunk := await file.read(1024 * 1024):
             total += len(chunk)
             if total > MAX_IMAGE_BYTES:
-                raise HTTPException(status_code=413, detail="????(?? 16MB)")
+                raise HTTPException(status_code=413, detail="图片过大（超过 16MB）")
             chunks.append(chunk)
         data = b"".join(chunks)
         try:

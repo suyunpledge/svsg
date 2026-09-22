@@ -329,7 +329,7 @@ def test_rebuilder_returning_still_dangling_fails():
 
 
 def test_partial_verification_result_degrades_missing_instances():
-    """L1.5 ?????????????????? E2003 ?????"""
+    """L1.5 部分验证结果缺失时，缺失实例按 E2003 路径降级不阻塞"""
     payload = _payload()
     payload["detections"][0]["verification_required"] = True
     backend = StubVerifierBackend(
