@@ -1,10 +1,10 @@
 # SVSG — Structured Visual Semantic Gateway
 
-**Lets an LLM understand images without relying on VLM's fuzzy vision.**
+**A structured visual-semantic gateway that grounds LLM reasoning in detector evidence rather than opaque visual interpretation.** [中文文档](README.zh.md)
 
 ## The Problem
 
-The conventional approach is to hand the image to GPT-4V / Claude Vision and let it "look and describe." But VLM visual perception is unstable:
+A conventional pipeline sends an image directly to a VLM such as GPT-4V or Claude Vision and accepts its description. That visual interpretation can be unstable:
 
 - Ask about the same image twice and the answers can contradict each other
 - Counting is often wrong ("the image has 3 apples" when there are actually 5)
@@ -12,7 +12,7 @@ The conventional approach is to hand the image to GPT-4V / Claude Vision and let
 
 ## SVSG's Approach
 
-**First translate the image into a structured IR (intermediate representation) using a detector, then feed that IR to the LLM for reasoning.**
+**SVSG first compiles the image into a structured intermediate representation (IR) with a detector, then gives that evidence to an LLM for reasoning.**
 
 ```
 Conventional:  Image → VLM (black box) → Answer (unreliable)
@@ -37,9 +37,9 @@ curl -X POST http://127.0.0.1:3002/v1/analyze-image \
 
 ## Two Core Capabilities
 
-### 1. Give the LLM a pair of accurate VLM "glasses"
+### 1. Separate visual detection from language reasoning
 
-A precise detector (YOLO) handles "seeing," and the LLM handles only "reasoning." A clear division of labor, each doing what it's best at.
+A detector such as YOLO performs visual recognition; the LLM reasons only over the resulting structured evidence. This separation makes each stage explicit and independently inspectable.
 
 ### 2. Evidence-anchored review
 
