@@ -60,7 +60,7 @@ class Claim(BaseModel):
     model_config = _STRICT
 
     # 断言关联的实例；全局性断言（如总数）可为 None
-    instance_id: int | None = Field(default=None, ge=1)
+    instance_id: int | None = Field(default=None, ge=1, strict=True)
     # 断言字段：class / count / exists / attribute:<name> / relation:<type> ...
     field: str = Field(..., min_length=1)
     value: ClaimValue = None

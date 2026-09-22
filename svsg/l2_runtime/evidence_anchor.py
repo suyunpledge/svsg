@@ -31,6 +31,7 @@ from dataclasses import dataclass
 
 from svsg.contracts import (
     IR,
+    Claim,
     ErrorCode,
     L3Answer,
     RelationType,
@@ -38,7 +39,11 @@ from svsg.contracts import (
     VerificationResult,
     VerificationStatus,
 )
-from svsg.l1_compiler.geometry_engine import relation_holds
+from svsg.l1_compiler.geometry_engine import (
+    center_distance_px,
+    distance_relations_allowed,
+    relation_holds,
+)
 
 AMBIGUOUS_LABEL = "ambiguous"
 
@@ -97,6 +102,38 @@ def missing_verifications(
     }
 
 
+def _claim_shape_error(claim: Claim) -> str | None:
+    """Reject unsupported claims before comparing values (bool is an int in Python)."""
+    field, value = claim.field, claim.value
+    if field == "count" or field.startswith("count:"):
+        if field == "count:" or claim.instance_id is not None:
+            return "计数断言须为全局断言，类别名不能为空"
+        if type(value) is not int or value < 0:
+            return "计数断言须使用非负整数（不能使用布尔值或浮点数）"
+        return None
+    if field not in ("class", "exists") and not field.startswith(("attribute:", "relation:")):
+        return f"不支持的断言字段: {field}"
+    if claim.instance_id is None:
+        return "实例级断言必须提供 instance_id"
+    if field == "class" and (not isinstance(value, str) or not value.strip()):
+        return "class 断言须使用非空字符串"
+    if field == "exists" and type(value) is not bool:
+        return "exists 断言须使用布尔值"
+    if field.startswith("attribute:"):
+        if not field.split(":", 1)[1] or not isinstance(value, str):
+            return "属性断言须提供属性名和字符串值"
+    if field.startswith("relation:"):
+        if type(value) is not int or value < 1 or value == claim.instance_id:
+            return "关系目标须为不同实例的正整数 ID"
+        try:
+            relation = RelationType(field.split(":", 1)[1])
+        except ValueError:
+            return "不支持的关系类型"
+        if relation == RelationType.DISTANCE_TO:
+            return "distance_to 数值断言尚无可校验的数值/单位契约，禁止交付"
+    return None
+
+
 def anchor_claims(
     ir: IR,
     answer: L3Answer,
@@ -106,10 +143,27 @@ def anchor_claims(
     by_id = {d.instance_id: d for d in ir.detections}
     results: dict[int, VerificationResult] = {}
     if report is not None and report.status == VerificationStatus.SUCCESS:
+        ids = [r.instance_id for r in report.results]
+        if (report.image_id != ir.image_id or len(ids) != len(set(ids))
+                or not set(ids) <= set(by_id)):
+            return [Violation(
+                code=ErrorCode.EVIDENCE_MISMATCH,
+                field="<report>",
+                reason="验证报告图像不匹配或包含重复/未知实例",
+            )]
         results = {r.instance_id: r for r in report.results}
 
     violations: list[Violation] = []
     for claim in answer.claims:
+        shape_error = _claim_shape_error(claim)
+        if shape_error is not None:
+            violations.append(Violation(
+                code=ErrorCode.EVIDENCE_MISMATCH,
+                field=claim.field,
+                instance_id=claim.instance_id,
+                reason=shape_error,
+            ))
+            continue
         # 引用不存在的实例 → 直接否决
         if claim.instance_id is not None and claim.instance_id not in by_id:
             violations.append(
@@ -124,6 +178,31 @@ def anchor_claims(
         det = by_id.get(claim.instance_id) if claim.instance_id is not None else None
         result = results.get(claim.instance_id) if claim.instance_id is not None else None
         field = claim.field
+
+        # Aggregate and non-existence fields must not bypass negative verifier evidence.
+        if result is not None and result.exists is False and field != "exists":
+            violations.append(Violation(
+                code=ErrorCode.EVIDENCE_MISMATCH, field=field,
+                instance_id=claim.instance_id,
+                reason="验证报告 exists=False，不能断言该实例的类别、属性或关系",
+            ))
+            continue
+        if field == "count" or field.startswith("count:"):
+            cls = field.split(":", 1)[1] if ":" in field else None
+            conflicting = any(
+                r.exists is False
+                or (cls is not None and r.class_label is not None
+                    and r.class_label != by_id[iid].object_class
+                    and (r.class_label == AMBIGUOUS_LABEL
+                         or cls in (r.class_label, by_id[iid].object_class)))
+                for iid, r in results.items()
+            )
+            if conflicting:
+                violations.append(Violation(
+                    code=ErrorCode.EVIDENCE_MISMATCH, field=field,
+                    reason="计数断言涉及验证报告中的存在性或类别冲突",
+                ))
+                continue
 
         if field == "class":
             if det is not None:
@@ -249,12 +328,8 @@ def anchor_claims(
 
         elif field.startswith("relation:"):
             rel_name = field.split(":", 1)[1]
-            if det is None or not isinstance(claim.value, int):
-                continue
-            try:
-                rel = RelationType(rel_name)
-            except ValueError:
-                continue  # 未知关系类型不参与锚定（L3 词表问题，另行审计）
+            assert det is not None and isinstance(claim.value, int)
+            rel = RelationType(rel_name)
             target = by_id.get(claim.value)
             if target is None:
                 violations.append(
@@ -265,7 +340,27 @@ def anchor_claims(
                         reason=f"关系断言引用了不存在的目标实例 {claim.value}",
                     )
                 )
-            elif not relation_holds(rel, det.bbox_px, target.bbox_px):
+                continue
+            target_result = results.get(target.instance_id)
+            if target_result is not None and target_result.exists is False:
+                violations.append(Violation(
+                    code=ErrorCode.EVIDENCE_MISMATCH, field=field,
+                    instance_id=claim.instance_id,
+                    reason="关系目标在验证报告中 exists=False",
+                ))
+                continue
+            if rel == RelationType.NEAREST_TO:
+                allowed = distance_relations_allowed(
+                    ir.scene_type, ir.camera_intrinsics is not None
+                )
+                distance = center_distance_px(det.bbox_px, target.bbox_px)
+                holds = allowed and all(
+                    distance <= center_distance_px(det.bbox_px, other.bbox_px)
+                    for other in ir.detections if other.instance_id != det.instance_id
+                )
+            else:
+                holds = relation_holds(rel, det.bbox_px, target.bbox_px)
+            if not holds:
                 violations.append(
                     Violation(
                         code=ErrorCode.EVIDENCE_MISMATCH,

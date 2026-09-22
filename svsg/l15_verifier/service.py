@@ -105,6 +105,13 @@ class L15Verifier:
                 self._backend.verify_batch(image_id, list(instance_ids)),
                 timeout=self.config.timeout_s,
             )
+            # Validate inside the failure boundary, before marking any call successful.
+            report = self._report(
+                report_id, image_id, VerificationStatus.SUCCESS, results, started
+            )
+            result_ids = [result.instance_id for result in report.results]
+            if len(result_ids) != len(set(result_ids)) or not set(result_ids) <= set(instance_ids):
+                raise ValueError("Verifier returned duplicate or unrequested instance IDs")
         except TimeoutError:
             return self._report(
                 report_id, image_id, VerificationStatus.TIMEOUT, [], started
@@ -114,9 +121,7 @@ class L15Verifier:
             return self._report(
                 report_id, image_id, VerificationStatus.ERROR, [], started
             )
-        return self._report(
-            report_id, image_id, VerificationStatus.SUCCESS, results, started
-        )
+        return report
 
     @staticmethod
     def _report(

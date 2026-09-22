@@ -32,7 +32,6 @@ from svsg.contracts import (
     IR,
     ErrorCode,
     L3Answer,
-    SceneType,
     StateCode,
     SVSGError,
     VerificationReport,
@@ -400,11 +399,8 @@ class Orchestrator:
         session: RuntimeSession,
     ) -> L3Answer | None:
         """调用 L3（受总超时约束）；超时/故障 → S5 并返回 None。"""
-        physical_metrics = (
-            eff_ir.scene_type == SceneType.ORTHOGRAPHIC
-            or eff_ir.camera_intrinsics is not None
-        )
-        system = build_system_prompt(physical_metrics)
+        # The current IR carries distance_px only, with no physical value/unit.
+        system = build_system_prompt(physical_metrics_available=False)
         context = build_context(
             query, eff_ir, report,
             degraded=degraded, disputed=disputed,

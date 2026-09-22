@@ -35,7 +35,8 @@ SYSTEM_PROMPT_TEMPLATE = (
    - {{"instance_id": <id>, "field": "attribute:<名称>", "value": <属性值>}}
    - {{"instance_id": <id>, "field": "relation:<类型>", "value": <目标 instance_id>}}
    relation 类型词表：left_of / right_of / above / below / contains /
-   overlaps / nearest_to / distance_to。
+   overlaps / nearest_to（按图像平面中心距离比较，须满足场景门控）。
+   distance_to 尚无数值与单位的断言契约，禁止输出该断言或具体距离数值。
 4. {distance_rule}
 5. conf_level 为 lowest、或列于 degraded_instances 的实例：final_answer 涉及该实例时，
    必须附带说明"该结论已经降级处理，待人工复审"。
@@ -48,7 +49,7 @@ SYSTEM_PROMPT_TEMPLATE = (
 UNSAFE_DISTANCE_RULE = (
     "涉及距离、远近表述时，必须附带免责声明（如"
     "\"图像平面内约 200 像素，非物理距离\"）；"
-    "当前场景未标定（metric_accuracy 不可用），严禁将像素距离表述为物理距离。"
+    "当前证据未提供物理距离数值与单位，严禁将像素距离表述为物理距离。"
 )
 
 SAFE_DISTANCE_RULE = (
@@ -59,7 +60,8 @@ SAFE_DISTANCE_RULE = (
 def build_system_prompt(physical_metrics_available: bool) -> str:
     """构建 system prompt。
 
-    physical_metrics_available：正视场景，或透视场景已提供相机内参。
+    physical_metrics_available：证据中确有标定后的物理数值与单位。
+    当前 IR 仅包含 distance_px，编排器始终传 False。
     """
     return SYSTEM_PROMPT_TEMPLATE.format(
         distance_rule=(
