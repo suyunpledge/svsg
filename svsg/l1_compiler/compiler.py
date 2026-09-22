@@ -85,7 +85,11 @@ class L1Compiler:
     def compile(self, image: ImageSource, meta: ImageMeta) -> IR:
         """执行完整编译管线；任何 S2 级问题以 SVSGError 抛出。"""
         raw = self._detector.detect(image)
-        return self._assemble(raw, meta)
+        try:
+            return self._assemble(raw, meta)
+        except ValidationError as exc:
+            # Nested Detection/Uncertainty validation must share the S2 boundary.
+            raise from_validation_error(exc) from exc
 
     # ------------------------------------------------------------------
 
@@ -152,7 +156,4 @@ class L1Compiler:
         if cfg.camera_intrinsics is not None:
             payload["camera_intrinsics"] = cfg.camera_intrinsics.model_dump()
 
-        try:
-            return IR.model_validate(payload)
-        except ValidationError as exc:  # S2 硬校验失败
-            raise from_validation_error(exc) from exc
+        return IR.model_validate(payload)

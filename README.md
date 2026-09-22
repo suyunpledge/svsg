@@ -19,21 +19,28 @@ Conventional:  Image → VLM (black box) → Answer (unreliable)
 SVSG:          Image → YOLO detection → IR (classes/positions/counts/relations) → LLM (white-box reasoning) → Answer (auditable)
 ```
 
-The LLM doesn't need to "see" the image — it only needs to understand the structured detection results. Every conclusion can be traced back to concrete detection evidence.
+The LLM doesn't need to "see" the image — it reasons over structured detection results. Supported claims are checked against those results and any available verification evidence. This checks consistency with the evidence; it does not prove that the detector is correct.
 
 ## Quick Start
 
 ```bash
-pip install -e ".[api,llm]"    # base service
-python -m svsg                 # start (default 127.0.0.1:3002)
+pip install -e ".[api,llm,ml]"
+cp .env.example .env
+# Edit .env: set your OpenAI-compatible endpoint, API key and model.
+# Set SVSG_DETECTOR=yolo for real detection (weights may need downloading).
+python -m svsg                 # default 127.0.0.1:3002
 ```
 
 ```bash
 # Upload an image + ask a question
 curl -X POST http://127.0.0.1:3002/v1/analyze-image \
-  -F "image=@photo.jpg" \
-  -F "question=How many red objects are in the image?"
+  -F "file=@photo.jpg" \
+  -F "query=How many objects were detected in the image?"
 ```
+
+For development without a detector model, install `.[api,llm]` and use `SVSG_DETECTOR=stub`. The demo detector returns fixed example classes scaled to the image size; it does not recognize image contents. The default `SVSG_LLM_PROVIDER=stub` has no scripted answers and returns `aborted` for otherwise valid requests. Configure an LLM provider or inject a scripted `StubLLM` to obtain an answer.
+
+The bundled L1.5 backend is also a stub. Requests requiring verification degrade to review when it has no results; real attribute verification requires a custom backend.
 
 ## Two Core Capabilities
 
@@ -43,7 +50,7 @@ A detector such as YOLO performs visual recognition; the LLM reasons only over t
 
 ### 2. Evidence-anchored review
 
-Every LLM output is anchored back to the detection evidence in the IR. Fabricated or unsupported claims are automatically rejected.
+Supported structured claims are anchored back to the IR and verification reports. Unknown fields, malformed values, missing instance references and conflicting evidence are rejected and enter the bounded regeneration/review flow. Natural-language `final_answer` is not fully semantically checked against `claims`; the current coverage warning is only a heuristic.
 
 ## Architecture
 
@@ -62,26 +69,33 @@ L1 detection compilation → L1.5 declaration verification → L2 runtime (FSM) 
 
 | | Conventional VLM direct answer | SVSG |
 |---|---|---|
-| Counting | Often wrong | Pixel-level detection, precise |
-| Spatial relations | Vague descriptions | Structured IR (left_of/right_of/contains) |
-| Auditability | Can't be traced | Every conclusion anchored to detection evidence |
-| Hallucination | High | Low (anchor verification auto-vetoes unsupported claims) |
-| Cost | Every call hits the VLM (expensive) | Detect once, LLM only reads text (cheap) |
+| Counting | Generated from visual interpretation | Checked against detected instances; missed/duplicate detections still affect accuracy |
+| Spatial relations | Expressed in generated text | Recomputed from bounding boxes |
+| Auditability | Depends on the model and application | Explicit IR, structured claims and validation outcomes |
+| Unsupported claims | Depends on model behavior | Supported structured claims are validated; natural-language alignment remains incomplete |
+| Cost | Depends on model and image usage | Detector inference plus text LLM calls; savings require workload measurement |
+
+Nearest-neighbor claims use image-plane center distances and obey the IR scene gate. Camera intrinsics alone do not provide depth or physical scale. Numeric `relation:distance_to` claims are rejected until the claim schema can carry and validate a distance value and unit.
 
 ## Authentication
 
 ```bash
-# Method 1: API Key
+# API key mode: set SVSG_API_KEY; SVSG_AUTH_ENABLED remains false.
 curl -H "X-API-Key: ***" ...
 
-# Method 2: Bearer token (requires prior registration)
+# Bearer mode: set SVSG_AUTH_ENABLED=1, then register and log in via /auth/*.
 curl -H "Authorization: Bearer ***" ...
 ```
+
+These modes are alternatives: enabling Bearer authentication replaces the API-key check. Without either setting, the API is unauthenticated and defaults to loopback. The first registered account becomes administrator; initialize it in a controlled environment. Registration remains open, and rate limiting is not implemented in the application.
 
 ## Testing
 
 ```bash
-python -m pytest -q    # 108 tests
+pip install -e ".[api,dev]"
+python -m pytest -q
+python -m ruff check svsg tests
+python -m mypy svsg
 ```
 
 ## License

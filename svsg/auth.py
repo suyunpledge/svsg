@@ -62,14 +62,17 @@ def verify_password(password: str, stored: str) -> bool:
     """按存储格式校验口令；格式异常一律视为不匹配（恒时比较）。"""
     try:
         algo, iters_s, salt_hex, digest_hex = stored.split("$")
-    except ValueError:
+        if algo != "pbkdf2_sha256":
+            return False
+        salt, expected = bytes.fromhex(salt_hex), bytes.fromhex(digest_hex)
+        if len(salt) != 16 or len(expected) != 32:
+            return False
+        digest = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), salt, int(iters_s)
+        )
+    except (ValueError, OverflowError):
         return False
-    if algo != "pbkdf2_sha256":
-        return False
-    digest = hashlib.pbkdf2_hmac(
-        "sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), int(iters_s)
-    )
-    return hmac.compare_digest(digest.hex(), digest_hex)
+    return hmac.compare_digest(digest, expected)
 
 
 def _token_digest(token: str) -> str:
@@ -132,13 +135,16 @@ class AuthStore:
 
     def create_user(self, username: str, password: str, *, iters: int) -> sqlite3.Row:
         """创建用户；首个用户自动成为管理员，重名抛 DuplicateUserError。"""
-        is_admin = 1 if self.count_users() == 0 else 0
+        # Compute the expensive hash before acquiring the database write lock.
+        pw_hash = hash_password(password, iters)
         try:
             with self._conn() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                is_admin = int(conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0)
                 conn.execute(
                     "INSERT INTO users (username, pw_hash, is_admin, created_at)"
                     " VALUES (?, ?, ?, ?)",
-                    (username, hash_password(password, iters), is_admin, _now_iso()),
+                    (username, pw_hash, is_admin, _now_iso()),
                 )
         except sqlite3.IntegrityError as exc:
             raise DuplicateUserError(username) from exc
